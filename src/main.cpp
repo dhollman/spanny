@@ -1,4 +1,7 @@
 #include <iostream>
+#include <future>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include "serial/serial.h"
 #include "mdspan.hpp"
@@ -18,53 +21,58 @@ struct robot_arm {
     serial::Timeout timeout = serial::Timeout::simpleTimeout(10000))
     : serial_(std::move(port), baudrate, std::move(timeout)) {}
 
-  tl::expected<bin_state, std::string> is_bin_occupied(int bin) const {
+  bin_state is_bin_occupied(int bin) {
     if (!serial_.isOpen()) {
-      return tl::make_unexpected("Error opening serial port");
+      throw std::runtime_error("Error opening serial port");
     }
     serial_.write(std::to_string(bin));
-    try {
-      auto const result = std::stoi(serial_.readline());
-      if (result == 1) {
-        return bin_state::OCCUPIED;
-      } 
-      return bin_state::EMPTY;
-    } catch (std::invalid_argument const& e) {
-        return tl::make_unexpected("Invalid argument from serial port");
-    } catch (std::out_of_range const& e) {
-        return tl::make_unexpected("Out of range from serial port");
-    }
+    auto const result = std::stoi(serial_.readline());
+    if (result == 1) {
+      return bin_state::OCCUPIED;
+    } 
+    return bin_state::EMPTY;
   }
   
-  mutable serial::Serial serial_; 
+  serial::Serial serial_;
 };
 
+struct bounds_checked_layout_policy {
+  template <class Extents>
+  struct mapping : stdex::layout_right::mapping<Extents> {
+    using base_t = stdex::layout_right::mapping<Extents>;
+    using base_t::base_t;
+    static_assert(Extents::rank() == 1, "Only supporting 1-D mappings for brevity");
+    std::ptrdiff_t operator()(auto idx) const {
+      if (idx < 0 || idx > this->extents().extent(0)) {
+        throw std::out_of_range("Invalid bin index");
+      }
+      return idx;
+    }
+  };
+};
 
-template <int nbins>
-struct bin_checker {
-  using element_type = tl::expected<bin_state, std::string>;
-  using reference = tl::expected<bin_state, std::string> const&;
+struct robot_command_accessor {
+  using element_type = bin_state;
+  using reference = std::future<bin_state>;
   using data_handle_type = robot_arm*;
 
-  inline static element_type const no_bin = tl::make_unexpected("Invalid bin index");
-  mutable element_type recent_ = tl::make_unexpected("Bin has not been accessed");
-
-  reference access(data_handle_type arm, std::ptrdiff_t offset) const {
-    if (offset < 0 || offset >= nbins) {
-      return no_bin;
-    }
-    try {
-      recent_ = arm->is_bin_occupied(static_cast<int>(offset));
-    } catch (std::exception const& e) {
-      recent_ = tl::make_unexpected(std::string{"Error opening serial port"});
-    }
-    return recent_;
+  reference access(data_handle_type ptr, std::ptrdiff_t offset) const {
+    // We know ptr will be valid asynchronously because we construct it on the stack
+    // of main. In real code we might want to use a shared_ptr or something
+    return std::async([=]{
+      return ptr->is_bin_occupied(static_cast<int>(offset));
+    });
   }
 };
 
-using ext_t = stdex::extents<uint32_t, 2, 3>;
-using acc_t = bin_checker<6>;
-using bin_view = stdex::mdspan<bin_state, ext_t, stdex::layout_right, acc_t>;
+using bin_view = stdex::mdspan<bin_state, 
+  // We know statically that there are 4 bins
+  stdex::extents<uint32_t, 6>,
+  // Our layout should do bounds-checking
+  bounds_checked_layout_policy,
+  // Our accessor should tell the robot to asynchronously access the bin
+  robot_command_accessor
+>;
 
 auto print_state = [](bin_state const& state) -> tl::expected<void, std::string> {
   switch (state) {
@@ -82,18 +90,18 @@ auto shrug = [](std::string const& msg) -> void {
   std::cout << "¯\\_(ツ)_/¯ " << msg;
 };
 
-int main(int, char **) {
+int main() {
   auto arm = robot_arm{"/dev/ttyACM0", 9600};
-  auto bins = bin_view(&arm, {}, bin_checker<6>{});
-  while(true) {
-  for (std::size_t i = 0; i != bins.extent(0); ++i) {
-    for (std::size_t j = 0; j != bins.extent(1); ++j) {
-      std::cout << "Bin " << i << ", " << j << " is ";
-      bins(i, j).and_then(print_state).or_else(shrug);
-      std::cout << "\n";
+  auto bins = bin_view(&arm);
+  for (auto ndx = 0; ndx < 6; ++ndx) {
+    std::cout << "Bin " << ndx << " is ";
+    try {
+      print_state(bins(ndx).get());
+    } catch (std::exception const& e) {
+      shrug(e.what());
     }
-  }
-  std::cout << "====================\n";
+    std::cout << "\n";
   }
   return 0;
 }
+
