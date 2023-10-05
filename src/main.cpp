@@ -5,7 +5,6 @@
 #include <string>
 #include "serial/serial.h"
 #include "mdspan.hpp"
-#include "expected.hpp"
 
 namespace stdex = std::experimental;
 
@@ -74,7 +73,7 @@ using bin_view = stdex::mdspan<bin_state,
   robot_command_accessor
 >;
 
-auto print_state = [](bin_state const& state) -> tl::expected<void, std::string> {
+auto print_state = [](bin_state const& state) {
   switch (state) {
     case bin_state::OCCUPIED:
       std::cout << "OCCUPIED";
@@ -83,7 +82,6 @@ auto print_state = [](bin_state const& state) -> tl::expected<void, std::string>
       std::cout << "EMPTY";
       break;
   }
-  return {};
 };
 
 auto shrug = [](std::string const& msg) -> void {
